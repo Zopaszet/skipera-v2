@@ -3,42 +3,55 @@ import time
 import requests
 
 from .types import QUESTION_TYPE_MAP, MODEL_MAP, deep_blank_model, WHITELISTED_QUESTION_TYPES
-from config import GRAPHQL_URL
+from skipera.config import GRAPHQL_URL
 from .queries import (GET_STATE_QUERY, SAVE_RESPONSES_QUERY, SUBMIT_DRAFT_QUERY,
                       INITIATE_ATTEMPT_QUERY)
 from loguru import logger
-from llm.connector import build_connector
+from skipera.llm.connector import build_connector
 
 
 class GradedSolver(object):
     def __init__(self, session: requests.Session, course_id: str, item_id: str,
-                 llm_settings: dict = None):
+                 llm_settings: dict = None, knowledge_context: str = ""):
         self.session: requests.Session = session
         self.course_id: str = course_id
         self.item_id: str = item_id
         self.llm_settings = llm_settings
+        self.knowledge_context = knowledge_context or ""
         self.attempt_id = None
         self.draft_id = None
         self.discarded_questions = []
         self.question_specs = {}
         self.last_error = ""
+        self.last_grade = ""          # e.g. "90% (9/10)"
+        self.preexisting_perfect = False
+        self.last_questions = {}
+        self.last_submitted = []
 
     def solve(self) -> str:
-        """Returns one of: passed, failed, no_attempts, no_llm, error."""
+        """Returns one of: passed, failed, no_attempts, no_llm, error.
+
+        Target is 100%: attempts repeat while the grade is below perfect
+        and the course still grants attempts.
+        """
+        state = self.get_state()
+        percent, earned, maximum = self.grade_info(state)
+        if maximum and earned >= maximum:
+            self.preexisting_perfect = True
+            logger.info(f"Sudah 100% ({self.last_grade}) — dilewati.")
+            return "passed"
+
+        retry_note = ""
         while True:
             state = self.get_state()
 
-            if state["outcome"] is not None and state["outcome"]["isPassed"]:
-                logger.debug("Already passed!")
-                return "passed"
-
             if state["allowedAction"] == "RESUME_DRAFT":
                 logger.info("Resuming in-progress attempt...")
-                status = self._solve_current_attempt()
-                if status == "passed":
-                    return "passed"
+                status = self._solve_current_attempt(retry_note)
                 if status == "no_llm":
                     return "no_llm"
+                if status == "error":
+                    return "error"
 
             elif state["allowedAction"] == "START_NEW_ATTEMPT":
                 remaining = state["attempts"]["attemptsRemaining"]
@@ -51,27 +64,109 @@ class GradedSolver(object):
                     logger.error("Could not start an attempt. Please file an issue.")
                     return "error"
 
-                status = self._solve_current_attempt()
-                if status == "passed":
-                    return "passed"
+                status = self._solve_current_attempt(retry_note)
                 if status == "no_llm":
                     return "no_llm"
+                if status == "error":
+                    return "error"
 
             else:
                 logger.error("Something went wrong! Please file an issue.")
                 return "error"
 
             state = self.get_state()
-            if state["outcome"] is not None and state["outcome"]["isPassed"]:
+            percent, earned, maximum = self.grade_info(state)
+            remaining = state["attempts"]["attemptsRemaining"]
+            logger.info(f"Nilai: {self.last_grade} | sisa attempt: {remaining}")
+
+            if maximum and earned >= maximum:
                 return "passed"
 
-            if state["allowedAction"] != "START_NEW_ATTEMPT" or state["attempts"]["attemptsRemaining"] == 0:
-                logger.error("Sorry! Could not pass the assignment, maybe use a better model.")
+            if state["allowedAction"] != "START_NEW_ATTEMPT" or remaining == 0:
+                logger.error(
+                    f"Berhenti di {self.last_grade} (attempt habis). "
+                    "Soal yang salah perlu dikerjakan manual via view-feedback.")
                 return "failed"
 
-            logger.warning("Attempt not passed. Retrying with a new attempt...")
+            retry_note = self._build_retry_note(state)
+            logger.warning(f"Belum 100% ({self.last_grade}). Mengerjakan ulang...")
 
-    def _solve_current_attempt(self) -> str:
+    def grade_info(self, state: dict) -> tuple:
+        """Returns (percent, earned, maximum) and caches a printable grade."""
+        earned, maximum = 0, 0
+        try:
+            fb = (state.get("feedback") or {}).get("outcome") or {}
+            if fb.get("maxScore"):
+                maximum = fb["maxScore"]
+                earned = fb.get("highestScore", fb.get("latestScore", 0)) or 0
+        except (AttributeError, TypeError):
+            pass
+        if not maximum:
+            try:
+                earned = float((state.get("outcome") or {}).get("earnedGrade", 0) or 0)
+            except (TypeError, ValueError):
+                earned = 0
+            maximum = 1
+        percent = (earned / maximum * 100) if maximum else 0
+        try:
+            self.last_grade = f"{percent:.0f}% ({earned:g}/{maximum:g})"
+        except (TypeError, ValueError):
+            self.last_grade = f"{percent:.0f}%"
+        return percent, earned, maximum
+
+    def feedback_scores(self, state: dict) -> dict:
+        """Map draft question_id -> (score, maxScore) from view-feedback data."""
+        scores = {}
+        try:
+            parts = (state.get("feedback") or {}).get("parts") or []
+        except AttributeError:
+            return scores
+        for part in parts:
+            fb = (part.get("feedback") or {}).get("outcome") or {}
+            if "score" not in fb:
+                continue
+            full_id = part.get("partId", "")
+            suffix = full_id.split("~")[-1]
+            scores[suffix] = (fb.get("score", 0), fb.get("maxScore", 0))
+        return scores
+
+    def _build_retry_note(self, state: dict) -> str:
+        """Describe the previous attempt's wrong questions for the next LLM call."""
+        scores = self.feedback_scores(state)
+        if not scores and not self.last_submitted:
+            return ""
+        # question_id (draft form) -> suffix used by feedback parts
+        wrong = []
+        for qid in self.question_specs:
+            suffix = qid.split("~")[-1]
+            hit = scores.get(suffix)
+            if hit is None:
+                # Fallback: positional match when counts align.
+                continue
+            score, maximum = hit
+            if maximum and score < maximum:
+                wrong.append(qid)
+        lines = [f"Hasil attempt sebelumnya: {self.last_grade}."]
+        if wrong:
+            lines.append(f"{len(wrong)} soal masih salah — perbaiki:")
+            prev = {a.get("question_id"): a for a in self.last_submitted}
+            for qid in wrong:
+                q = self.last_questions.get(qid, {})
+                prompt = str(q.get("prompt", ""))[:300]
+                lines.append(f"- {qid}: {prompt}")
+                options = q.get("options", [])
+                if options:
+                    opt_text = ", ".join(
+                        f"{o.get('option_id')[:8]}={str(o.get('value', ''))[:60]}"
+                        for o in options[:8])
+                    lines.append(f"  opsi: {opt_text}")
+                if qid in prev:
+                    lines.append(f"  jawabanmu sebelumnya: {prev[qid]}")
+        else:
+            lines.append("Tidak ada rincian soal yang salah; jawab ulang semuanya dengan teliti.")
+        return "\n".join(lines)
+
+    def _solve_current_attempt(self, retry_note: str = "") -> str:
         try:
             connector = build_connector(self.llm_settings)
         except Exception as exc:
@@ -79,8 +174,12 @@ class GradedSolver(object):
             return "no_llm"
 
         questions = self.retrieve_questions()
+        self.last_questions = questions
+        context = self.knowledge_context
+        if retry_note:
+            context = (context + "\n\n" if context else "") + "PREVIOUS ATTEMPT FEEDBACK:\n" + retry_note
         try:
-            answers = connector.get_response(questions)
+            answers = connector.get_response(questions, context=context)
         except Exception as exc:
             self.last_error = str(exc)
             logger.error(f"Could not get answers from LLM: {exc}")
@@ -282,10 +381,19 @@ class GradedSolver(object):
         Saves the responses for the assessment to the draft.
         """
         if isinstance(answers, dict):
-            answers = answers.get("responses", [])
+            if "responses" in answers:
+                answers = answers.get("responses", [])
+            elif answers.get("question_id"):
+                answers = [answers]  # single response object, not wrapped
+            else:
+                logger.debug(f"Format jawaban LLM tak dikenal: {str(answers)[:200]}")
+                answers = []
 
         answers_by_id = {}
         for answer in answers or []:
+            if not isinstance(answer, dict):
+                logger.debug(f"Item jawaban bukan object, dilewati: {str(answer)[:200]}")
+                continue
             question_id = answer.get("question_id")
             if question_id:
                 answers_by_id[question_id] = answer
@@ -298,6 +406,11 @@ class GradedSolver(object):
                 continue
 
             answer_responses.append(self._coerce_llm_answer(question_id, answer))
+
+        self.last_submitted = [
+            {"question_id": r["questionId"], "question_response": r["questionResponse"]}
+            for r in answer_responses
+        ]
 
         res = self.session.post(url=GRAPHQL_URL, params={
             "opname": "Submission_SaveResponses"
@@ -317,8 +430,18 @@ class GradedSolver(object):
         if "Submission_SaveResponsesSuccess" in res.text:
             return True
 
-        logger.debug(answer_responses)
-        logger.debug(res.json())
+        try:
+            body = res.json()
+            errors = (
+                body.get("data", {})
+                .get("Submission_SaveResponses", {})
+                .get("errors", [])
+            ) or body.get("errors", [])
+            logger.error(f"SaveResponses ditolak server: {str(errors)[:300]}")
+            logger.debug(answer_responses)
+            logger.debug(body)
+        except ValueError:
+            logger.error(f"SaveResponses gagal (HTTP {res.status_code}): {res.text[:300]}")
         return False
 
     def submit_draft(self) -> bool:

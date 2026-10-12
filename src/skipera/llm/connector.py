@@ -3,8 +3,8 @@ import json
 import requests
 from loguru import logger
 
-import config
-from config import SYSTEM_PROMPT
+import skipera.config as config
+from skipera.config import SYSTEM_PROMPT
 
 ANSWER_INSTRUCTIONS = (
     "Return JSON only with shape {\"responses\":[...]}. "
@@ -12,6 +12,23 @@ ANSWER_INSTRUCTIONS = (
     "For question_response, use exactly the key and shape requested in "
     "answer_format for that question."
 )
+
+CONTEXT_INSTRUCTIONS = (
+    "You are given course material (video transcripts + readings) as the "
+    "knowledge base. Prioritize it when answering: if the material covers "
+    "the question, base your answer on it. Otherwise fall back to general "
+    "knowledge."
+)
+
+
+def _build_user_content(questions: dict, context: str = "") -> str:
+    if context and context.strip():
+        return (
+            f"{CONTEXT_INSTRUCTIONS}\n\n"
+            f"--- COURSE MATERIAL START ---\n{context.strip()}\n--- COURSE MATERIAL END ---\n\n"
+            f"{ANSWER_INSTRUCTIONS}\n\n{json.dumps(questions)}"
+        )
+    return f"{ANSWER_INSTRUCTIONS}\n\n{json.dumps(questions)}"
 
 
 def _extract_json(raw_text: str) -> dict:
@@ -51,11 +68,11 @@ class GeminiConnector(object):
         self.system_prompt = system_prompt
         self.client = genai.Client(api_key=self.api_key)
 
-    def get_response(self, questions: dict) -> dict:
+    def get_response(self, questions: dict, context: str = "") -> dict:
         logger.debug(f"Making an API request to Gemini ({self.model})...")
         response = self.client.models.generate_content(
             model=self.model,
-            contents=f"{ANSWER_INSTRUCTIONS}\n\n{json.dumps(questions)}",
+            contents=_build_user_content(questions, context),
             config=self._types.GenerateContentConfig(
                 system_instruction=self.system_prompt,
                 response_mime_type="application/json",
@@ -115,13 +132,13 @@ class OpenAICompatibleConnector(object):
             )
             return requests.post(alt, json=payload, headers=headers, timeout=self.timeout)
 
-    def _request(self, questions: dict, use_json_mode: bool) -> requests.Response:
+    def _request(self, questions: dict, use_json_mode: bool, context: str = "") -> requests.Response:
         payload = {
             "model": self.model,
             "messages": [
                 {"role": "system", "content": self.system_prompt},
                 {"role": "user",
-                 "content": f"{ANSWER_INSTRUCTIONS}\n\n{json.dumps(questions)}"},
+                 "content": _build_user_content(questions, context)},
             ],
             "temperature": 0.2,
             "stream": False,
@@ -135,20 +152,20 @@ class OpenAICompatibleConnector(object):
 
         return self._post(payload, headers)
 
-    def get_response(self, questions: dict) -> dict:
+    def get_response(self, questions: dict, context: str = "") -> dict:
         logger.debug(
             f"Making an API request to {self.base_url} "
             f"(model={self.model or 'default'})..."
         )
 
-        response = self._request(questions, use_json_mode=True)
+        response = self._request(questions, use_json_mode=True, context=context)
         # Many local routers reject response_format; retry once without it.
         if response.status_code in (400, 404, 415, 422):
             logger.debug(
                 f"Endpoint rejected JSON mode ({response.status_code}); "
                 "retrying without response_format..."
             )
-            response = self._request(questions, use_json_mode=False)
+            response = self._request(questions, use_json_mode=False, context=context)
 
         if response.status_code >= 400:
             raise RuntimeError(

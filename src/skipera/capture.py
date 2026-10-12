@@ -9,7 +9,9 @@ open a real (persistent profile) browser, do the item once, and record every
 client — no brittle selectors.
 
 Install:
-    pip install playwright && playwright install chromium
+    pip install playwright
+    # No browser download needed when Google Chrome is installed
+    # (used automatically via channel="chrome").
 
 Usage:
     skipera --capture https://www.coursera.org/learn/<slug>/coach/<itemId>/<slug>
@@ -22,10 +24,14 @@ from loguru import logger
 
 DEFAULT_PROFILE = Path.home() / ".skipera" / "browser-profile"
 CAPTURE_HINTS = ("/api/", "/graphql", "graphql-gateway")
+# Telemetry / analytics noise that is never a course endpoint.
+CAPTURE_NOISE = ("sentry.io", "sentry-cdn.com", "/api/rest/v1/eventing")
 
 
 def _record(request, records: list) -> None:
     url = request.url
+    if any(noise in url for noise in CAPTURE_NOISE):
+        return
     if not any(hint in url for hint in CAPTURE_HINTS):
         return
     entry = {"method": request.method, "url": url}
@@ -35,6 +41,7 @@ def _record(request, records: list) -> None:
     except Exception:
         pass
     records.append(entry)
+    logger.info(f"[rekam #{len(records)}] {request.method} {url[:160]}")
 
 
 def run_capture(url: str, out_path: str = "skipera_capture.json",
@@ -48,7 +55,7 @@ def run_capture(url: str, out_path: str = "skipera_capture.json",
     except ImportError:
         logger.error(
             "Playwright belum terpasang. Jalankan:\n"
-            "  pip install playwright && playwright install chromium"
+            "  pip install playwright"
         )
         raise SystemExit(1)
 
@@ -58,7 +65,15 @@ def run_capture(url: str, out_path: str = "skipera_capture.json",
 
     logger.info(f"Profil browser: {profile} (login Coursera di sini kalau diminta)")
     with sync_playwright() as p:
-        context = p.chromium.launch_persistent_context(str(profile), headless=False)
+        try:
+            context = p.chromium.launch_persistent_context(
+                str(profile), headless=False, channel="chrome")
+            logger.info("Browser: Google Chrome terinstal.")
+        except Exception as exc:
+            logger.warning(
+                f"Google Chrome tidak ditemukan ({exc}); "
+                "fallback ke Chromium bawaan Playwright...")
+            context = p.chromium.launch_persistent_context(str(profile), headless=False)
         page = context.pages[0] if context.pages else context.new_page()
         page.on("request", lambda req: _record(req, records))
         page.goto(url, wait_until="domcontentloaded")
@@ -67,6 +82,7 @@ def run_capture(url: str, out_path: str = "skipera_capture.json",
             "Browser terbuka. Login bila perlu, lalu kerjakan SATU item "
             "(Role Play / Dialogue / discussion) secara manual."
         )
+        logger.info("Setiap request /api + GraphQL yang terekam akan tampil di sini.")
         logger.info("Setelah selesai, kembali ke terminal ini dan tekan Enter untuk menyimpan hasil rekaman.")
         try:
             input()
@@ -76,6 +92,9 @@ def run_capture(url: str, out_path: str = "skipera_capture.json",
 
         Path(out_path).write_text(json.dumps(records, indent=2))
         context.close()
+
+    if not records:
+        logger.warning("Tidak ada request terekam — pastikan item dikerjakan di browser sebelum menekan Enter.")
 
     logger.success(f"Terekam {len(records)} request -> {out_path}")
     logger.info("Kirim isi file ini agar pemanggilan API-nya bisa dibuat (tanpa Playwright).")

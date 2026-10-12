@@ -661,6 +661,29 @@ fragment QueryStateSuccess on Submission_SubmissionState {
       ...OverallOutcome
       __typename
     }
+    parts {
+      __typename
+      ... on Submission_GradedMultipleChoiceQuestion {
+        partId: id
+        feedback { outcome { score maxScore __typename } __typename }
+        __typename
+      }
+      ... on Submission_GradedMultipleChoiceReflectQuestion {
+        partId: id
+        feedback { outcome { score maxScore __typename } __typename }
+        __typename
+      }
+      ... on Submission_GradedCheckboxQuestion {
+        partId: id
+        feedback { outcome { score maxScore __typename } __typename }
+        __typename
+      }
+      ... on Submission_GradedCheckboxReflectQuestion {
+        partId: id
+        feedback { outcome { score maxScore __typename } __typename }
+        __typename
+      }
+    }
     __typename
   }
   outcome {
