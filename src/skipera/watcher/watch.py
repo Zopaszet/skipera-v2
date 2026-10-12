@@ -2,7 +2,7 @@
 import time
 import requests
 from loguru import logger
-import config
+import skipera.config as config
 
 class Watcher(object):
     def __init__(self, session: requests.Session, item: dict, metadata: dict, user_id: str, slug: str, course_id: str):

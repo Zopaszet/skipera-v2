@@ -22,7 +22,7 @@ Graded assessments are completed with the assistance of an LLM API.
 ```bash
 conda env create -f environment.yml
 conda activate skipera
-playwright install chromium   # only needed for the --capture (Role Play/Dialogue) mode
+playwright install chromium   # fallback only; Google Chrome is used automatically if installed
 ```
 
 ### pip
@@ -37,8 +37,12 @@ Or install the published package:
 pip install skipera
 ```
 
-The project uses a **flat layout** — `main.py`, `config.py`, `report.py` and the
-`assessment/`, `llm/`, `watcher/` packages live directly in the repository root.
+The project uses a **`src` layout** — all code lives in the `skipera` package
+under `src/skipera/` (`cli.py`, `config.py`, `report.py`, `capture.py`,
+`knowledge.py`, plus the `assessment/`, `llm/`, `watcher/` subpackages).
+A thin `main.py` shim stays in the repository root so `python main.py`
+keeps working; the recommended entry points are `skipera` and
+`python -m skipera`.
 
 ## Configuration
 
@@ -181,7 +185,7 @@ Every run writes a per-item summary so you can see exactly what was completed, s
 skipera introduction-psychology --llm --summary-dir ./reports
 ```
 
-This produces:
+Files land in `--summary-dir`, or by default in `reports/<slug>/`. This produces:
 
 - `skipera_summary_<slug>.json` / `.md` — full per-item table.
 - `skipera_resume_<slug>.md` — an actionable **resume checklist**: which items still need work vs. which are done.
@@ -193,6 +197,26 @@ The console output ends with two explicit sections:
 - **SKIP — sudah selesai**: items already done (skipped videos, readings, passed quizzes).
 
 So the summary doubles as your to-do list: work down `RESUME`, and the rest can be skipped on the next run.
+
+Items already checklisted on Coursera (`Completed` in `onDemandCoursesProgress`)
+are skipped automatically (`ALREADY_DONE`) without any API writes — except
+quizzes, which keep their grade flow so sub-100% scores still get retried.
+
+## Course knowledge base (transcripts + readings)
+
+Every run also saves each video transcript and reading into a single
+Markdown file named after the course:
+
+```bash
+skipera introduction-psychology
+# -> knowledge/introduction-psychology.md (one section per menu item)
+```
+
+When quizzes are solved with `--llm`, the collected texts are injected into
+the LLM prompt as the knowledge base (most recent files first, capped by
+`--max-context-chars`, default 40000), so answers are grounded in the actual
+course material. Disable with `--no-knowledge`, re-fetch with
+`--refresh-knowledge`, change subtitle language with `--knowledge-lang`.
 
 ## Debugging unsupported items
 
@@ -207,6 +231,17 @@ This prints the type distribution, flags dialog/role-play candidates, and writes
 Currently, only the single-choice and multiple-choice objective questions are supported in this mode. Note that you might
 not always achieve passing marks due to the LLM hallucinating sometimes.
 
+### Grade target: 100% with view-feedback retry
+
+After each submission skipera reads the grade (`highestScore/maxScore`) and
+attempts left from the same data behind the `view-feedback` page — no browser
+needed. Anything below 100% is retried while attempts remain, and the next
+attempt is told exactly which questions were wrong (per-question
+`score/maxScore` from `feedback.parts`) plus your previous answers, so the
+LLM can fix them. Quizzes already at 100% are skipped (`ALREADY_DONE`) without
+touching your attempts. Fully-watched videos are skipped the same way (server
+`viewedUpTo` check).
+
 ## Browser-assisted capture (Playwright) for Role Play / Dialogue / discussion
 
 These items are rendered by a JS SPA and talk to endpoints that only exist for a
@@ -217,8 +252,8 @@ every `/api` + GraphQL request. From that capture the exact endpoint can be turn
 into a stable HTTP client (no browser needed afterwards).
 
 ```bash
-# 1. one-time install
-pip install playwright && playwright install chromium
+# 1. one-time install (skipped if Google Chrome is already installed)
+pip install playwright
 
 # 2. record a Role Play / Dialogue / discussion item
 skipera --capture "https://www.coursera.org/learn/<slug>/coach/<itemId>/<slug>" --capture-out capture.json
@@ -332,6 +367,26 @@ Di akhir output konsol ada dua bagian:
 
 Jadi summary ini sekaligus jadi daftar to-do: kerjakan bagian RESUME, sisanya bisa di-skip pada run berikutnya.
 
+Item yang sudah checklist di Coursera (`Completed` di `onDemandCoursesProgress`)
+otomatis dilewati (`ALREADY_DONE`) tanpa API writes — kecuali kuis yang tetap
+mengikuti alur nilai agar skor <100% tetap di-retry.
+
+#### 4c. Knowledge base course (transkrip + bacaan)
+
+Setiap run juga menyimpan transkrip tiap video dan isi tiap bacaan ke satu
+file Markdown bernama sesuai slug course:
+
+```bash
+skipera <slug>
+# -> knowledge/<slug>.md (satu section per menu)
+```
+
+Saat kuis dikerjakan dengan `--llm`, teks-teks tersebut disuntikkan ke prompt
+LLM sebagai basis ilmu (file terbaru didahulukan, dibatasi
+`--max-context-chars`, default 40000), sehingga jawaban berdasar materi asli
+course. Nonaktifkan dengan `--no-knowledge`, fetch ulang dengan
+`--refresh-knowledge`, ganti bahasa subtitle dengan `--knowledge-lang`.
+
 #### 4c. Memilih Model & Cek Ketersediaan
 Gunakan `--list-models` untuk melihat model yang benar-benar tersedia (model yang sedang dipakai ditandai `*`):
 
@@ -371,8 +426,8 @@ Saat menjalankan `--llm`, Skipera memvalidasi model yang dipilih dan memberi per
 Item coach/discussion dirender oleh SPA dan endpoint-nya hanya muncul saat sudah login, jadi tidak bisa lewat HTTP biasa. Daripada menebak selector DOM, Skipera menyediakan **perekam Playwright lokal**: membuka browser asli (profil persisten), Anda kerjakan itemnya **sekali** secara manual, dan semua request `/api` + GraphQL direkam. Dari rekaman itu, endpoint-nya bisa diubah menjadi pemanggilan API langsung yang stabil.
 
 ```bash
-# install sekali
-pip install playwright && playwright install chromium
+# install sekali (dilewati bila Google Chrome sudah terinstal)
+pip install playwright
 
 # rekam satu item Role Play / Dialogue / diskusi
 skipera --capture "https://www.coursera.org/learn/<slug>/coach/<itemId>/<slug>" --capture-out capture.json
@@ -391,6 +446,16 @@ skipera <slug> --diagnose
 Perintah ini mencetak distribusi tipe item (termasuk `raw -> override`), menandai kandidat dialog/role play, dan menulis `skipera_all_items.json`. Tambahkan `--dump-items` pada run biasa untuk menyimpan payload yang sama.
 
 > **Catatan Mode Kuis (LLM):** AI kadang-kadang bisa memberikan halusinasi (jawaban tak akurat). Anda mungkin mengalami kondisi tidak langsung lulus karena nilai tak cukup, sehingga butuh retake atau pengecekan mandiri. Selain itu per tugas rata-rata menghabiskan ~5000 input tokens.
+
+#### 4g. Target nilai 100% dengan retry berbasis view-feedback
+
+Setelah submit, Skipera membaca nilai (`highestScore/maxScore`) dan sisa
+attempt dari data yang sama di balik halaman `view-feedback` — tanpa browser.
+Selama belum 100% dan attempt masih ada, kuis dikerjakan ulang, dan attempt
+berikutnya diberi tahu soal mana saja yang salah (skor per-soal dari
+`feedback.parts`) plus jawabanmu sebelumnya agar diperbaiki LLM. Kuis yang
+sudah 100% dilewati (`ALREADY_DONE`) tanpa memakan attempt. Video yang sudah
+ditonton penuh juga dilewati (cek `viewedUpTo` server).
 
 ## Lisensi
 
