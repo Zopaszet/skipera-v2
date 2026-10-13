@@ -13,7 +13,10 @@ ANSWER_INSTRUCTIONS = (
     "MC->{\"multipleChoiceResponse\":{\"chosen\":\"O1\"}}; "
     "MS->{\"checkboxResponse\":{\"chosen\":[\"O1\",\"O2\"]}}; "
     "TXT->{\"plainTextResponse\":{\"plainText\":\"...\"}} (for "
-    "Numeric/Math/Regex/TextExactMatch use the same value under that key). "
+    "Numeric/Math/Regex/TextExactMatch/TextReflect use "
+    "{\"plainTextResponse\":{\"plainText\":\"...\"}} or "
+    "{\"textReflectResponse\":{\"answer\":\"...\"}}; "
+    "for RichText use {\"richTextResponse\":{\"richText\":{\"value\":\"...\"}}}). "
     "Do NOT include answer_format per question."
 )
 
@@ -36,27 +39,81 @@ def _build_user_content(questions: dict, context: str = "") -> str:
 
 
 def _extract_json(raw_text: str) -> dict:
-    """Parse a JSON response, tolerating markdown code fences and extra prose."""
+    """Parse a JSON response, tolerating markdown fences, prose, and trailing noise.
+
+    Strategy: extract fenced block if present, then decode the first complete
+    JSON value with ``raw_decode`` (ignores trailing garbage instead of raising
+    "Extra data"). Prefers the object containing a ``responses`` key when the
+    model emits several JSON blocks (thinking traces, retries, echoes).
+    """
     cleaned = (raw_text or "").strip()
+    if not cleaned:
+        raise ValueError("Empty LLM response (no JSON to parse)")
+
+    # 1. Prefer fenced code block content (```json ... ``` or ``` ... ```).
+    if "```" in cleaned:
+        try:
+            parts = cleaned.split("```")
+            # Odd-indexed parts are inside fences.
+            candidates = [p.strip() for i, p in enumerate(parts) if i % 2 == 1 and p.strip()]
+            for cand in candidates:
+                if cand.startswith("json"):
+                    cand = cand[4:].strip()
+                try:
+                    return json.loads(cand)
+                except json.JSONDecodeError:
+                    continue
+            # Fall through: use the longest fenced block as cleaned text.
+            if candidates:
+                longest = max(candidates, key=len)
+                if longest.startswith("json"):
+                    longest = longest[4:].strip()
+                cleaned = longest
+        except (IndexError, ValueError):
+            pass
+        else:
+            cleaned = cleaned.strip().strip("`").strip()
+            if cleaned.startswith("json"):
+                cleaned = cleaned[4:].strip()
+
+    # 2. Direct parse (pure JSON).
     try:
         return json.loads(cleaned)
     except json.JSONDecodeError:
         pass
 
-    if cleaned.startswith("```"):
-        cleaned = cleaned.strip("`").strip()
-        if cleaned.startswith("json"):
-            cleaned = cleaned[4:].strip()
+    decoder = json.JSONDecoder()
 
-    try:
-        return json.loads(cleaned)
-    except json.JSONDecodeError:
-        # Last resort: grab the first {...} block.
-        start = cleaned.find("{")
-        end = cleaned.rfind("}")
-        if start != -1 and end > start:
-            return json.loads(cleaned[start:end + 1])
-        raise
+    def _scan_candidates(text: str):
+        """Yield (obj) for each balanced {...}/[...] block, preferring 'responses'."""
+        found = []
+        idx, n = 0, len(text)
+        while idx < n:
+            nxt_obj = text.find("{", idx)
+            nxt_arr = text.find("[", idx)
+            if nxt_obj == -1 and nxt_arr == -1:
+                break
+            start = nxt_obj
+            if nxt_arr != -1 and (nxt_obj == -1 or nxt_arr < nxt_obj):
+                start = nxt_arr
+            try:
+                obj, end = decoder.raw_decode(text, start)
+            except json.JSONDecodeError:
+                idx = start + 1
+                continue
+            found.append(obj)
+            idx = end
+        # Prefer blocks carrying the expected payload.
+        found.sort(key=lambda o: 0 if isinstance(o, dict) and "responses" in o else 1)
+        return found
+
+    for obj in _scan_candidates(cleaned):
+        if isinstance(obj, dict):
+            return obj
+
+    # 3. Nothing decoded: raise with a short preview for debuggability.
+    preview = cleaned[:300].replace("\n", " ")
+    raise ValueError(f"Could not parse LLM JSON (preview: {preview})")
 
 
 class GeminiConnector(object):

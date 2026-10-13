@@ -47,6 +47,82 @@ def _clean_text(raw, limit):
     return text
 
 
+# Leaf key per response_field untuk text-type questions (reshaping jawaban teks).
+_TEXT_LEAF = {
+    "plainTextResponse": "plainText",
+    "textReflectResponse": "answer",
+    "textExactMatchResponse": "answer",
+    "mathResponse": "answer",
+    "regexResponse": "answer",
+    "numericResponse": "answer",
+}
+
+# Response-field keys yang membawa jawaban teks (untuk lenient fallback).
+_TEXT_FIELDS = (
+    "plainTextResponse",
+    "textReflectResponse",
+    "textExactMatchResponse",
+    "mathResponse",
+    "regexResponse",
+    "numericResponse",
+    "richTextResponse",
+)
+
+
+def _extract_text(value):
+    """Pull a plain string out of any text-leaf shape (max one level deep)."""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, dict):
+        for key in ("plainText", "answer", "text", "value", "richText"):
+            v = value.get(key)
+            if isinstance(v, str):
+                return v
+            if isinstance(v, dict):
+                for k2 in ("value", "text", "answer", "plainText"):
+                    v2 = v.get(k2)
+                    if isinstance(v2, str):
+                        return v2
+        return ""
+    if isinstance(value, list):
+        return " ".join(str(x) for x in value if isinstance(x, str))
+    return str(value) if value is not None else ""
+
+
+def _sanitize_response(response_field: str, value):
+    """Coerce a response value into a non-nullable, correctly-shaped payload.
+
+    - checkboxResponse: ``chosen`` -> list ([] bila None/kosong)
+    - multipleChoiceResponse: ``chosen`` -> str ("" bila None/list kosong)
+    - text leaves (plainText/answer/...): -> "" bila None
+    - richTextResponse: ``{"richText": {"value": "..."}}`` ("" bila None)
+    Returns a new dict, never mutates the input.
+    """
+    if response_field == "checkboxResponse":
+        chosen = value.get("chosen") if isinstance(value, dict) else value
+        if chosen is None:
+            return {"chosen": []}
+        if isinstance(chosen, str):
+            return {"chosen": [chosen] if chosen else []}
+        if isinstance(chosen, list):
+            return {"chosen": [c for c in chosen if c]}
+        return {"chosen": []}
+    if response_field == "multipleChoiceResponse":
+        chosen = value.get("chosen") if isinstance(value, dict) else value
+        if chosen is None:
+            return {"chosen": ""}
+        if isinstance(chosen, list):
+            return {"chosen": chosen[0] if chosen else ""}
+        return {"chosen": chosen if isinstance(chosen, str) else ""}
+    if response_field == "richTextResponse":
+        inner = value.get("richText") if isinstance(value, dict) else None
+        text = _extract_text(inner if isinstance(inner, dict) else value)
+        return {"richText": {"value": text}}
+    # Text leaves: normalize key to the canonical leaf, value to a string.
+    leaf = _TEXT_LEAF.get(response_field, "answer")
+    return {leaf: _extract_text(value)}
+
+
 class GradedSolver(object):
     def __init__(self, session: requests.Session, course_id: str, item_id: str,
                  llm_settings: dict = None, knowledge_context: str = "",
@@ -73,6 +149,9 @@ class GradedSolver(object):
         self.full_map = {}    # short_qid -> full_qid
         self.opt_map = {}     # short_qid -> {short_opt: full_opt_id}
         self._last_full_map = {}
+        self._wrong_detail = {}  # full_qid -> {prompt, options, prev_full} untuk rebuild note
+        self._best_ratio = 0.0   # rasio tertinggi (stall cap, tahan reshuffle maximum)
+        self._stall_counter = 0  # banyak attempt tanpa perbaikan best
 
     def solve(self) -> str:
         """Returns one of: passed, failed, no_attempts, no_llm, error.
@@ -91,6 +170,10 @@ class GradedSolver(object):
 
         retry_note = ""
         wrong_qids = None  # None = semua soal, [] = tak ada rincian
+        # Stall cap: hentikan loop bila skor tak membaik N attempt berturut-turut.
+        earned_ratio = (earned / maximum) if maximum else 0.0
+        self._best_ratio = earned_ratio
+        self._stall_counter = 0
         while True:
             state = self.get_state()
             if not state:
@@ -110,7 +193,8 @@ class GradedSolver(object):
                     logger.error("No more attempts can be made!")
                     return "no_attempts"
 
-                logger.info(f"Starting a new attempt ({remaining} remaining before this run)...")
+                rem_label = remaining if remaining is not None else "tak terbatas"
+                logger.info(f"Starting a new attempt ({rem_label} remaining before this run)...")
                 if not self.initiate_attempt():
                     logger.error("Could not start an attempt. Please file an issue.")
                     return "error"
@@ -129,15 +213,35 @@ class GradedSolver(object):
             if not state:
                 return "error"
             percent, earned, maximum = self.grade_info(state)
-            remaining = state["attempts"]["attemptsRemaining"]
-            logger.info(f"Nilai: {self.last_grade} | sisa attempt: {remaining}")
+            remaining_raw = state["attempts"]["attemptsRemaining"]
+            rem_label = remaining_raw if remaining_raw is not None else "tak terbatas"
+            logger.info(f"Nilai: {self.last_grade} | sisa attempt: {rem_label}")
 
             if maximum and earned >= maximum:
                 return "passed"
 
-            if state["allowedAction"] != "START_NEW_ATTEMPT" or remaining == 0:
+            # Stall cap: pakai rasio earned/maximum agar tahan reshuffle.
+            ratio = (earned / maximum) if maximum else 0.0
+            if ratio > self._best_ratio + 1e-9:
+                self._best_ratio = ratio
+                self._stall_counter = 0
+            else:
+                self._stall_counter += 1
+            if self._stall_counter >= 3:
+                logger.error(
+                    f"Skor stagnan di {self.last_grade} selama {self._stall_counter} attempt — berhenti, "
+                    "perlu di-resume manual via view-feedback.")
+                return "failed"
+
+            if remaining_raw is not None and remaining_raw == 0:
                 logger.error(
                     f"Berhenti di {self.last_grade} (attempt habis). "
+                    "Soal yang salah perlu dikerjakan manual via view-feedback.")
+                return "failed"
+
+            if state["allowedAction"] != "START_NEW_ATTEMPT":
+                logger.error(
+                    f"Berhenti di {self.last_grade} (attempt habis — action={state['allowedAction']}). "
                     "Soal yang salah perlu dikerjakan manual via view-feedback.")
                 return "failed"
 
@@ -207,35 +311,53 @@ class GradedSolver(object):
         return scores
 
     def _build_retry_note(self, state: dict, wrong_qids=None) -> str:
-        """Describe the previous attempt's wrong questions for the next LLM call (kompak)."""
+        """Describe the previous attempt's wrong questions for the next LLM call (kompak).
+
+        Selain string, simpan ``self._wrong_detail`` (keyed by full_qid) dengan
+        prompt clean + options (full_opt_id, val) + prev_full, agar note bisa
+        di-rebuild dengan penomoran Q/O BARU bila soal berubah antar attempt.
+        """
         if wrong_qids is None:
             wrong_qids = self._wrong_qids(state)
         if not wrong_qids and not self.last_submitted:
             return ""
         lines = [f"Hasil attempt sebelumnya: {self.last_grade}."]
+        self._wrong_detail = {}
         if wrong_qids:
             lines.append(f"{len(wrong_qids)} soal masih salah — perbaiki:")
             prev = {a.get("question_id"): a for a in self.last_submitted}
             for full_qid in wrong_qids:
                 short_qid = self.short_map.get(full_qid, full_qid)
                 q = self.last_questions.get(short_qid, {})
-                prompt = str(q.get("prompt", ""))[:150]
-                lines.append(f"- {short_qid}: {prompt}")
+                prompt_clean = _clean_text(str(q.get("prompt", "")), 150)
                 options = q.get("options", [])
+                # Detail stabil keyed by full id (opt -> full_opt_id)
+                detail = {
+                    "prompt": prompt_clean,
+                    "options": [],
+                    "prev_full": [],
+                }
+                for o in options[:4]:
+                    short_opt = o.get("id", "")
+                    full_opt = self.opt_map.get(short_qid, {}).get(short_opt, short_opt)
+                    detail["options"].append((full_opt, str(o.get("v", ""))[:40]))
+                self._wrong_detail[full_qid] = detail
+
+                lines.append(f"- {short_qid}: {prompt_clean}")
                 if options:
                     opt_text = ", ".join(
-                        f"{o.get('id')}={str(o.get('v', ''))[:40]}"
-                        for o in options[:4])
+                        f"{o.get('id')}={str(o.get('v', ''))[:40]}" for o in options[:4])
                     lines.append(f"  opsi: {opt_text}")
                 if full_qid in prev:
                     ans = prev[full_qid]
-                    # Tampilkan short opt ids saja
                     qr = ans.get("question_response", {})
                     chosen = qr.get("multipleChoiceResponse", {}).get("chosen") or \
                              qr.get("checkboxResponse", {}).get("chosen") or []
                     if isinstance(chosen, str):
                         chosen = [chosen]
-                    # Translate full -> short
+                    # Simpan FULL opt id (stabil lintas reshuffle) untuk rebuild
+                    self._wrong_detail[full_qid]["prev_full"] = list(chosen)
+                    # Translate full -> short untuk tampilan
                     opt_reverse = {}
                     for so, fo in (self.opt_map.get(short_qid, {}).items()):
                         opt_reverse[fo] = so
@@ -245,6 +367,91 @@ class GradedSolver(object):
             lines.append("Tidak ada rincian soal yang salah; jawab ulang semuanya dengan teliti.")
         return "\n".join(lines)
 
+    def _build_sibling_appendix(self, subset_shorts: set) -> str:
+        """Context appendix: soal benar yang TIDAK dikirim ke LLM + jawabannya.
+
+        Menutup lubang korelasi: LLM butuh isi studi kasus + jawaban Q-benarnya
+        agar uraian konsisten. Prompt ≤200 chars, teks ≤300, MC/checkbox tampil
+        sebagai short opt + nilai ≤60 chars.
+        """
+        prev = {a.get("question_id"): a for a in self.last_submitted}
+        lines = []
+        for short_qid in self.last_questions:
+            full_qid = self.full_map.get(short_qid, short_qid)
+            if short_qid in subset_shorts or full_qid in subset_shorts:
+                continue
+            q = self.last_questions.get(short_qid, {})
+            prompt = _clean_text(str(q.get("prompt", "")), 200)
+            ans = prev.get(full_qid)
+            ans_text = "belum dijawab"
+            if ans:
+                qr = ans.get("question_response", {}) or {}
+                if "multipleChoiceResponse" in qr:
+                    chosen_full = qr["multipleChoiceResponse"].get("chosen")
+                    shown = self._short_opt(short_qid, chosen_full)
+                    opt_val = self._opt_value(short_qid, shown)[:60]
+                    ans_text = f"{shown} ({opt_val})" if opt_val else shown
+                elif "checkboxResponse" in qr:
+                    chosen_list = qr["checkboxResponse"].get("chosen") or []
+                    items = []
+                    for c in chosen_list:
+                        so = self._short_opt(short_qid, c)
+                        ov = self._opt_value(short_qid, so)[:60]
+                        items.append(f"{so} ({ov})" if ov else so)
+                    ans_text = ", ".join(items) or "(kosong)"
+                else:
+                    for key, val in qr.items():
+                        ans_text = _extract_text(val)[:300]
+                        break
+                    ans_text = ans_text or "(kosong)"
+            lines.append(f"- {short_qid}: {prompt} | jawabanmu: {ans_text}")
+        if not lines:
+            return ""
+        return "SOAL LAIN & JAWABANMU (untuk konsistensi):\n" + "\n".join(lines)
+
+    def _short_opt(self, short_qid, full_opt_id) -> str:
+        """Full option id -> short id (untuk ditampilkan ke LLM)."""
+        for so, fo in (self.opt_map.get(short_qid, {}) or {}).items():
+            if fo == full_opt_id:
+                return so
+        return str(full_opt_id or "")
+
+    def _opt_value(self, short_qid, short_opt) -> str:
+        """Cari nilai clean opsi dari last_questions."""
+        opts = (self.last_questions.get(short_qid, {}) or {}).get("options", []) or []
+        for o in opts:
+            if o.get("id") == short_opt:
+                return str(o.get("v", ""))
+        return ""
+
+    def _rebuild_retry_note(self, ask_wrong) -> str:
+        """Rebuild retry note hanya untuk qid yang masih ada, dengan penomoran Q/O BARU."""
+        if not ask_wrong:
+            return ""
+        lines = [f"Hasil attempt sebelumnya: {self.last_grade}."]
+        lines.append(f"{len(ask_wrong)} soal masih salah — perbaiki:")
+        for full_qid in ask_wrong:
+            short_qid = self.short_map.get(full_qid, full_qid)
+            detail = self._wrong_detail.get(full_qid, {})
+            prompt_clean = detail.get("prompt", "")
+            if not prompt_clean:
+                q = self.last_questions.get(short_qid, {})
+                prompt_clean = _clean_text(str(q.get("prompt", "")), 150)
+            lines.append(f"- {short_qid}: {prompt_clean}")
+            # options: full_opt_id -> short id via opt_map BARU
+            opt_reverse = {fo: so for so, fo in self.opt_map.get(short_qid, {}).items()}
+            stored_opts = detail.get("options", [])
+            if stored_opts:
+                opt_text = ", ".join(
+                    f"{opt_reverse.get(fo, fo)}={str(val)[:40]}"
+                    for fo, val in stored_opts[:4])
+                lines.append(f"  opsi: {opt_text}")
+            prev_full = detail.get("prev_full", [])
+            if prev_full:
+                short_chosen = [opt_reverse.get(c, c) for c in prev_full]
+                lines.append(f"  dulu: {short_chosen}")
+        return "\n".join(lines)
+
     def _solve_current_attempt(self, retry_note: str = "", only_qids=None) -> str:
         try:
             connector = build_connector(self.llm_settings)
@@ -252,20 +459,59 @@ class GradedSolver(object):
             logger.error(f"Skipping graded assessment: could not build LLM connector ({exc}).")
             return "no_llm"
 
+        # A. Snapshot attempt SEBELUM retrieve_questions() me-reset spec/maps.
+        prev_qids = set(self.question_specs)          # kosong saat attempt pertama
+        prev_answered = {a.get("question_id"): a for a in self.last_submitted}
+
         questions = self.retrieve_questions()
         self.last_questions = questions
         self._last_full_map = dict(self.full_map)
+        new_qids = set(self.question_specs)
 
-        # Filter subset jika only_qids diberikan
-        if only_qids and len(only_qids) < len(questions):
+        # B. Tentukan subset soal untuk LLM + apakah reuse jawaban lama.
+        #    Hanya relevan saat only_qids diberikan (retry). only_qids is None
+        #    -> perilaku lama persis (semua soal, tanpa reuse).
+        reuse_qids = set()      # full_qid correct lama yang masih ada -> reuse
+        effective_only = None   # None => mode full (semua soal ke LLM)
+        if only_qids is not None:
+            only_set = set(only_qids)
+            new_order = list(self.question_specs)  # urutan draft BARU
+            still_wrong = [q for q in new_order if q in only_set]
+            brand_new = [q for q in new_order if q not in prev_qids]
+            ask = still_wrong + brand_new  # dedup otomatis (still_wrong ⊆ prev)
+            if brand_new:
+                logger.info(
+                    f"Soal berubah antar attempt (bank acak): {len(brand_new)} soal baru "
+                    "ikut dikirim ke LLM")
+            if not still_wrong and brand_new:
+                logger.warning(
+                    "Soal attempt baru semuanya berbeda — retry_note lama dibuang, mode full")
+                retry_note = ""
+            if not ask or len(ask) >= len(new_qids):
+                effective_only = None  # fallback / semua soal
+            else:
+                effective_only = set(ask)
+            # Reuse: correct lama yang STILL ada (∈ new_qids) dan bukan yang salah
+            reuse_qids = {q for q in prev_answered
+                          if q in new_qids and q not in only_qids}
+            # C. Jika soal/urutan berubah, rebuild retry_note dengan penomoran Q/O BARU.
+            #    Selalu rebuild saat still_wrong non-empty: idempoten bila soal & urutan
+            #    sama, tapi memperbaiki penomoran bila ada reshuffle / subset berubah.
+            if still_wrong:
+                retry_note = self._rebuild_retry_note(still_wrong)
+
+        # Filter subset untuk LLM
+        subset_shorts = None
+        if effective_only is not None and len(effective_only) < len(questions):
             subset = {}
             for short_qid, payload in questions.items():
                 full_qid = self.full_map.get(short_qid, short_qid)
-                if full_qid in only_qids:
+                if full_qid in effective_only:
                     subset[short_qid] = payload
             if subset:
                 questions = subset
-                logger.debug(f"LLM hanya menerima {len(questions)} soal salah")
+                subset_shorts = set(subset)
+                logger.debug(f"LLM hanya menerima {len(questions)} soal")
 
         # Prefer knowledge filtered by the retrieved questions (summarized +
         # relevance-ranked); fall back to the prebuilt context when unavailable.
@@ -281,6 +527,11 @@ class GradedSolver(object):
                 logger.debug(f"Gagal memuat knowledge relevan: {exc}")
         if retry_note:
             context = (context + "\n\n" if context else "") + "PREVIOUS ATTEMPT FEEDBACK:\n" + retry_note
+        # Sibling appendix: jawaban soal benar untuk konsistensi (hemat, hanya subset).
+        if subset_shorts is not None:
+            appendix = self._build_sibling_appendix(subset_shorts)
+            if appendix:
+                context = (context + "\n\n" if context else "") + appendix
         try:
             answers = connector.get_response(questions, context=context)
         except Exception as exc:
@@ -288,16 +539,14 @@ class GradedSolver(object):
             logger.error(f"Could not get answers from LLM: {exc}")
             return "error"
 
-        # Merge: reuse jawaban benar dari last_submitted + jawaban baru LLM
+        # Merge: reuse jawaban lama yang correct DAN masih ada + jawaban baru LLM.
+        # Entri basi (qid ∉ new_qids) tidak ikut merged. save_responses iterasi
+        # question_specs BARU, jadi soal tanpa jawaban otomatis jadi blank.
         answers_list = answers.get("responses", answers) if isinstance(answers, dict) else answers
-        if only_qids and self.last_submitted:
+        if reuse_qids and self.last_submitted:
             merged = []
-            # Reuse yang correct (tidak di only_qids)
-            for ans in self.last_submitted:
-                full_qid = ans.get("question_id")
-                if full_qid not in only_qids:
-                    merged.append(ans)
-            # Tambah jawaban baru LLM
+            for qid in reuse_qids:
+                merged.append(prev_answered[qid])
             for ans in (answers_list if isinstance(answers_list, list) else [answers_list]):
                 if isinstance(ans, dict):
                     merged.append(ans)
@@ -389,6 +638,8 @@ class GradedSolver(object):
         for question in questions:
             typename = question["__typename"]
             if typename not in QUESTION_TYPE_MAP:  # discard unknown question types
+                logger.debug(
+                    f"Q?: {typename} — dibuang (tipe tidak dikenal)")
                 continue
 
             full_qid = question["partId"]
@@ -399,6 +650,7 @@ class GradedSolver(object):
             }
 
             if typename not in WHITELISTED_QUESTION_TYPES:
+                logger.debug(f"{full_qid}: {typename} — dibuang (belum didukung)")
                 self.discarded_questions.append({
                     "questionId": full_qid,
                     "questionType": QUESTION_TYPE_MAP[typename][1],
@@ -414,6 +666,7 @@ class GradedSolver(object):
             short_qid = f"Q{q_counter}"
             self.short_map[full_qid] = short_qid
             self.full_map[short_qid] = full_qid
+            logger.debug(f"{short_qid}: {typename} — whitelisted")
 
             questions_formatted[short_qid] = self._format_question_for_llm(question, short_qid)
 
@@ -459,11 +712,13 @@ class GradedSolver(object):
 
     def _blank_response_payload(self, question_id: str) -> dict:
         spec = self.question_specs[question_id]
+        blank = _sanitize_response(
+            spec["response_field"], deep_blank_model(MODEL_MAP[spec["typename"]]))
         return {
             "questionId": question_id,
             "questionType": spec["question_type"],
             "questionResponse": {
-                spec["response_field"]: deep_blank_model(MODEL_MAP[spec["typename"]])
+                spec["response_field"]: blank
             }
         }
 
@@ -504,27 +759,31 @@ class GradedSolver(object):
         answer = self._translate_answer(question_id, answer)
 
         raw_response = answer.get("question_response", {})
+        if not isinstance(raw_response, dict):
+            raw_response = {}
+
+        value = None
         if response_field in raw_response:
+            value = raw_response[response_field]
+        elif response_field in _TEXT_LEAF or response_field == "richTextResponse":
+            # Lenient: ambil nilai teks dari field/leaf alternatif mana pun.
+            for tf in _TEXT_FIELDS:
+                if tf in raw_response:
+                    value = raw_response[tf]
+                    break
+            if value is None:
+                for lk in ("plainText", "answer", "text", "value", "richText"):
+                    if lk in raw_response:
+                        value = raw_response[lk]
+                        break
+        if value is not None:
             return {
                 "questionId": question_id,
                 "questionType": spec["question_type"],
                 "questionResponse": {
-                    response_field: raw_response[response_field]
+                    response_field: _sanitize_response(response_field, value)
                 }
             }
-
-        # Lenient: terima field text alternatif
-        text_fields = {"plainTextResponse", "textExactMatchResponse", "mathResponse", "regexResponse"}
-        if response_field in text_fields:
-            for tf in text_fields:
-                if tf in raw_response:
-                    return {
-                        "questionId": question_id,
-                        "questionType": spec["question_type"],
-                        "questionResponse": {
-                            response_field: raw_response[tf]
-                        }
-                    }
 
         # Backward compatibility for the old connector schema.
         if answer.get("type") in {"Single", "Multi"} and "option_id" in answer:
@@ -546,7 +805,8 @@ class GradedSolver(object):
                     "questionId": question_id,
                     "questionType": spec["question_type"],
                     "questionResponse": {
-                        response_field: candidate[response_field]
+                        response_field: _sanitize_response(
+                            response_field, candidate[response_field])
                     }
                 }
 
