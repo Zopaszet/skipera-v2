@@ -1,3 +1,5 @@
+import html
+import re
 import time
 
 import requests
@@ -10,10 +12,45 @@ from loguru import logger
 from skipera.llm.connector import build_connector
 
 
+# Short type codes for LLM payload (hemat token)
+_SHORT_TYPE_MAP = {
+    "Submission_MultipleChoiceQuestion": "MC",
+    "Submission_MultipleChoiceReflectQuestion": "MC",
+    "Submission_CheckboxQuestion": "MS",
+    "Submission_CheckboxReflectQuestion": "MS",
+    "Submission_PlainTextQuestion": "TXT",
+    "Submission_TextReflectQuestion": "TXT",
+    "Submission_NumericQuestion": "TXT",
+    "Submission_MathQuestion": "TXT",
+    "Submission_RegexQuestion": "TXT",
+    "Submission_TextExactMatchQuestion": "TXT",
+}
+
+
+def _clean_text(raw, limit):
+    """Bersihkan HTML/CML, collapse whitespace, truncate ke limit."""
+    if not raw:
+        return ""
+    text = str(raw)
+    # Coba cml_to_markdown jika ada HTML
+    if '<' in text:
+        try:
+            from skipera.knowledge import cml_to_markdown
+            text = cml_to_markdown(text)
+        except Exception:
+            # Fallback: regex strip tags
+            text = re.sub(r'<[^>]+>', ' ', text)
+    text = html.unescape(text)
+    text = re.sub(r'\s+', ' ', text).strip()
+    if len(text) > limit:
+        text = text[:limit] + '…'
+    return text
+
+
 class GradedSolver(object):
     def __init__(self, session: requests.Session, course_id: str, item_id: str,
                  llm_settings: dict = None, knowledge_context: str = "",
-                 knowledge_dir=None, course_slug: str = "", max_chars: int = 8000):
+                 knowledge_dir=None, course_slug: str = "", max_chars: int = 4000):
         self.session: requests.Session = session
         self.course_id: str = course_id
         self.item_id: str = item_id
@@ -31,6 +68,11 @@ class GradedSolver(object):
         self.preexisting_perfect = False
         self.last_questions = {}
         self.last_submitted = []
+        # Short-id maps (hemat token): full partId <-> "Q1".. / full optionId <-> "O1"..
+        self.short_map = {}   # full_qid -> short_qid
+        self.full_map = {}    # short_qid -> full_qid
+        self.opt_map = {}     # short_qid -> {short_opt: full_opt_id}
+        self._last_full_map = {}
 
     def solve(self) -> str:
         """Returns one of: passed, failed, no_attempts, no_llm, error.
@@ -48,6 +90,7 @@ class GradedSolver(object):
             return "passed"
 
         retry_note = ""
+        wrong_qids = None  # None = semua soal, [] = tak ada rincian
         while True:
             state = self.get_state()
             if not state:
@@ -55,7 +98,7 @@ class GradedSolver(object):
 
             if state["allowedAction"] == "RESUME_DRAFT":
                 logger.info("Resuming in-progress attempt...")
-                status = self._solve_current_attempt(retry_note)
+                status = self._solve_current_attempt(retry_note, only_qids=wrong_qids)
                 if status == "no_llm":
                     return "no_llm"
                 if status == "error":
@@ -72,7 +115,7 @@ class GradedSolver(object):
                     logger.error("Could not start an attempt. Please file an issue.")
                     return "error"
 
-                status = self._solve_current_attempt(retry_note)
+                status = self._solve_current_attempt(retry_note, only_qids=wrong_qids)
                 if status == "no_llm":
                     return "no_llm"
                 if status == "error":
@@ -98,8 +141,30 @@ class GradedSolver(object):
                     "Soal yang salah perlu dikerjakan manual via view-feedback.")
                 return "failed"
 
-            retry_note = self._build_retry_note(state)
+            # Hitung soal salah untuk retry hemat token
+            wrong_qids = self._wrong_qids(state)
+            if wrong_qids and len(wrong_qids) < len(self.question_specs):
+                logger.info(f"Retry hanya {len(wrong_qids)} soal salah dari {len(self.question_specs)} total")
+            else:
+                wrong_qids = None  # Fallback: semua soal
+            retry_note = self._build_retry_note(state, wrong_qids)
             logger.warning(f"Belum 100% ({self.last_grade}). Mengerjakan ulang...")
+
+    def _wrong_qids(self, state: dict) -> list:
+        """Return list full_qid yang score<max (untuk retry hemat token)."""
+        scores = self.feedback_scores(state)
+        if not scores:
+            return []
+        wrong = []
+        for qid in self.question_specs:
+            suffix = qid.split("~")[-1]
+            hit = scores.get(suffix)
+            if hit is None:
+                continue
+            score, maximum = hit
+            if maximum and score < maximum:
+                wrong.append(qid)
+        return wrong
 
     def grade_info(self, state: dict) -> tuple:
         """Returns (percent, earned, maximum) and caches a printable grade."""
@@ -141,43 +206,46 @@ class GradedSolver(object):
             scores[suffix] = (fb.get("score", 0), fb.get("maxScore", 0))
         return scores
 
-    def _build_retry_note(self, state: dict) -> str:
-        """Describe the previous attempt's wrong questions for the next LLM call."""
-        scores = self.feedback_scores(state)
-        if not scores and not self.last_submitted:
+    def _build_retry_note(self, state: dict, wrong_qids=None) -> str:
+        """Describe the previous attempt's wrong questions for the next LLM call (kompak)."""
+        if wrong_qids is None:
+            wrong_qids = self._wrong_qids(state)
+        if not wrong_qids and not self.last_submitted:
             return ""
-        # question_id (draft form) -> suffix used by feedback parts
-        wrong = []
-        for qid in self.question_specs:
-            suffix = qid.split("~")[-1]
-            hit = scores.get(suffix)
-            if hit is None:
-                # Fallback: positional match when counts align.
-                continue
-            score, maximum = hit
-            if maximum and score < maximum:
-                wrong.append(qid)
         lines = [f"Hasil attempt sebelumnya: {self.last_grade}."]
-        if wrong:
-            lines.append(f"{len(wrong)} soal masih salah — perbaiki:")
+        if wrong_qids:
+            lines.append(f"{len(wrong_qids)} soal masih salah — perbaiki:")
             prev = {a.get("question_id"): a for a in self.last_submitted}
-            for qid in wrong:
-                q = self.last_questions.get(qid, {})
-                prompt = str(q.get("prompt", ""))[:300]
-                lines.append(f"- {qid}: {prompt}")
+            for full_qid in wrong_qids:
+                short_qid = self.short_map.get(full_qid, full_qid)
+                q = self.last_questions.get(short_qid, {})
+                prompt = str(q.get("prompt", ""))[:150]
+                lines.append(f"- {short_qid}: {prompt}")
                 options = q.get("options", [])
                 if options:
                     opt_text = ", ".join(
-                        f"{o.get('option_id')[:8]}={str(o.get('value', ''))[:60]}"
-                        for o in options[:8])
+                        f"{o.get('id')}={str(o.get('v', ''))[:40]}"
+                        for o in options[:4])
                     lines.append(f"  opsi: {opt_text}")
-                if qid in prev:
-                    lines.append(f"  jawabanmu sebelumnya: {prev[qid]}")
+                if full_qid in prev:
+                    ans = prev[full_qid]
+                    # Tampilkan short opt ids saja
+                    qr = ans.get("question_response", {})
+                    chosen = qr.get("multipleChoiceResponse", {}).get("chosen") or \
+                             qr.get("checkboxResponse", {}).get("chosen") or []
+                    if isinstance(chosen, str):
+                        chosen = [chosen]
+                    # Translate full -> short
+                    opt_reverse = {}
+                    for so, fo in (self.opt_map.get(short_qid, {}).items()):
+                        opt_reverse[fo] = so
+                    short_chosen = [opt_reverse.get(c, c) for c in chosen]
+                    lines.append(f"  dulu: {short_chosen}")
         else:
             lines.append("Tidak ada rincian soal yang salah; jawab ulang semuanya dengan teliti.")
         return "\n".join(lines)
 
-    def _solve_current_attempt(self, retry_note: str = "") -> str:
+    def _solve_current_attempt(self, retry_note: str = "", only_qids=None) -> str:
         try:
             connector = build_connector(self.llm_settings)
         except Exception as exc:
@@ -186,6 +254,19 @@ class GradedSolver(object):
 
         questions = self.retrieve_questions()
         self.last_questions = questions
+        self._last_full_map = dict(self.full_map)
+
+        # Filter subset jika only_qids diberikan
+        if only_qids and len(only_qids) < len(questions):
+            subset = {}
+            for short_qid, payload in questions.items():
+                full_qid = self.full_map.get(short_qid, short_qid)
+                if full_qid in only_qids:
+                    subset[short_qid] = payload
+            if subset:
+                questions = subset
+                logger.debug(f"LLM hanya menerima {len(questions)} soal salah")
+
         # Prefer knowledge filtered by the retrieved questions (summarized +
         # relevance-ranked); fall back to the prebuilt context when unavailable.
         context = self.knowledge_context
@@ -207,7 +288,22 @@ class GradedSolver(object):
             logger.error(f"Could not get answers from LLM: {exc}")
             return "error"
 
-        if not self.save_responses(answers.get("responses", answers)):
+        # Merge: reuse jawaban benar dari last_submitted + jawaban baru LLM
+        answers_list = answers.get("responses", answers) if isinstance(answers, dict) else answers
+        if only_qids and self.last_submitted:
+            merged = []
+            # Reuse yang correct (tidak di only_qids)
+            for ans in self.last_submitted:
+                full_qid = ans.get("question_id")
+                if full_qid not in only_qids:
+                    merged.append(ans)
+            # Tambah jawaban baru LLM
+            for ans in (answers_list if isinstance(answers_list, list) else [answers_list]):
+                if isinstance(ans, dict):
+                    merged.append(ans)
+            answers_list = merged
+
+        if not self.save_responses(answers_list):
             logger.error("Could not save responses. Please file an issue.")
             return "error"
 
@@ -285,13 +381,18 @@ class GradedSolver(object):
         questions_formatted = {}
         self.discarded_questions = []
         self.question_specs = {}
+        self.short_map = {}
+        self.full_map = {}
+        self.opt_map = {}
 
+        q_counter = 0
         for question in questions:
             typename = question["__typename"]
             if typename not in QUESTION_TYPE_MAP:  # discard unknown question types
                 continue
 
-            self.question_specs[question["partId"]] = {
+            full_qid = question["partId"]
+            self.question_specs[full_qid] = {
                 "typename": typename,
                 "response_field": QUESTION_TYPE_MAP[typename][0],
                 "question_type": QUESTION_TYPE_MAP[typename][1],
@@ -299,7 +400,7 @@ class GradedSolver(object):
 
             if typename not in WHITELISTED_QUESTION_TYPES:
                 self.discarded_questions.append({
-                    "questionId": question["partId"],
+                    "questionId": full_qid,
                     "questionType": QUESTION_TYPE_MAP[typename][1],
                     "questionResponse": {
                         QUESTION_TYPE_MAP[typename][0]:
@@ -308,7 +409,13 @@ class GradedSolver(object):
                 })
                 continue
 
-            questions_formatted[question["partId"]] = self._format_question_for_llm(question)
+            # Assign short ID
+            q_counter += 1
+            short_qid = f"Q{q_counter}"
+            self.short_map[full_qid] = short_qid
+            self.full_map[short_qid] = full_qid
+
+            questions_formatted[short_qid] = self._format_question_for_llm(question, short_qid)
 
         if self.discarded_questions:
             types = sorted({q["questionType"] for q in self.discarded_questions})
@@ -319,48 +426,34 @@ class GradedSolver(object):
 
         return questions_formatted
 
-    def _format_question_for_llm(self, question: dict) -> dict:
+    def _format_question_for_llm(self, question: dict, short_qid: str) -> dict:
         typename = question["__typename"]
         schema = question.get("questionSchema", {})
+        raw_prompt = schema.get("prompt", {}).get("cmlValue") or schema.get("prompt", {}).get("value") or ""
         payload = {
-            "question_id": question["partId"],
-            "question_type": QUESTION_TYPE_MAP[typename][1],
-            "prompt": schema.get("prompt", {}).get("cmlValue") or schema.get("prompt", {}).get("value") or "",
+            "question_id": short_qid,
+            "type": _SHORT_TYPE_MAP.get(typename, "TXT"),
+            "prompt": _clean_text(raw_prompt, 2000),
         }
 
         if "options" in schema:
-            payload["options"] = [
-                {
-                    "option_id": option.get("optionId", ""),
-                    "value": option.get("display", {}).get("cmlValue") or option.get("display", {}).get("value") or "",
-                }
-                for option in schema["options"]
-            ]
+            opt_map = {}
+            o_counter = 0
+            options_list = []
+            for option in schema["options"]:
+                o_counter += 1
+                short_opt = f"O{o_counter}"
+                full_opt_id = option.get("optionId", "")
+                opt_map[short_opt] = full_opt_id
+                raw_value = option.get("display", {}).get("cmlValue") or option.get("display", {}).get("value") or ""
+                options_list.append({
+                    "id": short_opt,
+                    "v": _clean_text(raw_value, 500),
+                })
+            self.opt_map[short_qid] = opt_map
+            payload["options"] = options_list
 
-        if typename in {"Submission_MultipleChoiceQuestion", "Submission_MultipleChoiceReflectQuestion"}:
-            payload["answer_format"] = {
-                "multipleChoiceResponse": {
-                    "chosen": "single option_id string"
-                }
-            }
-        elif typename in {"Submission_CheckboxQuestion", "Submission_CheckboxReflectQuestion"}:
-            payload["answer_format"] = {
-                "checkboxResponse": {
-                    "chosen": ["option_id", "..."]
-                }
-            }
-        elif typename == "Submission_PlainTextQuestion":
-            payload["answer_format"] = {
-                "plainTextResponse": {
-                    "plainText": "short plain answer"
-                }
-            }
-        else:
-            payload["answer_format"] = {
-                QUESTION_TYPE_MAP[typename][0]: {
-                    "answer": "short answer"
-                }
-            }
+        # answer_format dihapus — dijelaskan sekali di ANSWER_INSTRUCTIONS connector
 
         return payload
 
@@ -374,9 +467,41 @@ class GradedSolver(object):
             }
         }
 
+    def _translate_answer(self, question_id, answer):
+        """Translate short opt ids -> full opt ids sebelum coerce.
+
+        ``question_id`` is the full partId; opt_map is keyed by the short id.
+        """
+        if not isinstance(answer, dict):
+            return answer
+        short_qid = self.short_map.get(question_id, question_id)
+        opt_reverse = {so: fo for so, fo in self.opt_map.get(short_qid, {}).items()}
+        if not opt_reverse:
+            return answer
+        qr = answer.get("question_response", {})
+        if not isinstance(qr, dict):
+            return answer
+        opt_reverse = {so: fo for so, fo in self.opt_map.get(short_qid, {}).items()}
+        # multipleChoiceResponse.chosen
+        mc = qr.get("multipleChoiceResponse", {})
+        if isinstance(mc, dict) and "chosen" in mc:
+            chosen = mc["chosen"]
+            if isinstance(chosen, str) and chosen in opt_reverse:
+                mc["chosen"] = opt_reverse[chosen]
+        # checkboxResponse.chosen
+        cb = qr.get("checkboxResponse", {})
+        if isinstance(cb, dict) and "chosen" in cb:
+            chosen = cb["chosen"]
+            if isinstance(chosen, list):
+                cb["chosen"] = [opt_reverse.get(c, c) for c in chosen]
+        return answer
+
     def _coerce_llm_answer(self, question_id: str, answer: dict) -> dict:
         spec = self.question_specs[question_id]
         response_field = spec["response_field"]
+
+        # Translate short -> full sebelum proses
+        answer = self._translate_answer(question_id, answer)
 
         raw_response = answer.get("question_response", {})
         if response_field in raw_response:
@@ -387,6 +512,19 @@ class GradedSolver(object):
                     response_field: raw_response[response_field]
                 }
             }
+
+        # Lenient: terima field text alternatif
+        text_fields = {"plainTextResponse", "textExactMatchResponse", "mathResponse", "regexResponse"}
+        if response_field in text_fields:
+            for tf in text_fields:
+                if tf in raw_response:
+                    return {
+                        "questionId": question_id,
+                        "questionType": spec["question_type"],
+                        "questionResponse": {
+                            response_field: raw_response[tf]
+                        }
+                    }
 
         # Backward compatibility for the old connector schema.
         if answer.get("type") in {"Single", "Multi"} and "option_id" in answer:
@@ -426,15 +564,29 @@ class GradedSolver(object):
             else:
                 logger.debug(f"Format jawaban LLM tak dikenal: {str(answers)[:200]}")
                 answers = []
+        elif isinstance(answers, list):
+            pass  # sudah list
+        else:
+            answers = []
 
         answers_by_id = {}
         for answer in answers or []:
             if not isinstance(answer, dict):
                 logger.debug(f"Item jawaban bukan object, dilewati: {str(answer)[:200]}")
                 continue
-            question_id = answer.get("question_id")
-            if question_id:
-                answers_by_id[question_id] = answer
+            qid = answer.get("question_id")
+            if not qid:
+                continue
+            # Normalize short -> full
+            if qid in self.full_map:
+                qid = self.full_map[qid]
+            elif qid not in self.question_specs:
+                # Coba reverse lookup
+                for full, short in self.short_map.items():
+                    if short == qid:
+                        qid = full
+                        break
+            answers_by_id[qid] = answer
 
         answer_responses = []
         for question_id in self.question_specs:

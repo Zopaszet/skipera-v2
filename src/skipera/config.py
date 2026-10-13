@@ -182,7 +182,9 @@ LLM_MODEL = (
 
 SYSTEM_PROMPT = (
     "Answer all provided assessment questions and return strict JSON only. "
-    "Use each question's answer_format exactly as the response shape. "
+    "Each question has a short type code (MC/MS/TXT); respond using the "
+    "matching question_response key (multipleChoiceResponse/checkboxResponse/"
+    "plainTextResponse) and choose only the given option ids. "
     "Be concise and deterministic. Ignore HTML noise in prompts/options."
 )
 

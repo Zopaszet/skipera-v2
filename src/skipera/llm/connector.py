@@ -9,8 +9,12 @@ from skipera.config import SYSTEM_PROMPT
 ANSWER_INSTRUCTIONS = (
     "Return JSON only with shape {\"responses\":[...]}. "
     "Each item must include question_id and question_response. "
-    "For question_response, use exactly the key and shape requested in "
-    "answer_format for that question."
+    "For question_response, use the short type code mapping: "
+    "MC->{\"multipleChoiceResponse\":{\"chosen\":\"O1\"}}; "
+    "MS->{\"checkboxResponse\":{\"chosen\":[\"O1\",\"O2\"]}}; "
+    "TXT->{\"plainTextResponse\":{\"plainText\":\"...\"}} (for "
+    "Numeric/Math/Regex/TextExactMatch use the same value under that key). "
+    "Do NOT include answer_format per question."
 )
 
 CONTEXT_INSTRUCTIONS = (

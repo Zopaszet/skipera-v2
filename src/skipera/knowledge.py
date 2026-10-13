@@ -444,7 +444,7 @@ def save_knowledge(course_slug: str, knowledge_dir: str | Path, order: int,
 
 
 def load_knowledge_context(knowledge_dir: str | Path, course_slug: str,
-                           max_chars: int = 8000, query=None) -> str:
+                           max_chars: int = 4000, query=None) -> str:
     """Read the summarized knowledge, keeping within ``max_chars``.
 
     The ``.summary.md`` file wins; when it is missing, the full file is

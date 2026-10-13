@@ -35,7 +35,7 @@ class Skipera(object):
     def __init__(self, course: str, llm: bool, llm_settings: dict = None,
                  summary_dir: str = "", dump_items: bool = False, diagnose: bool = False,
                  knowledge_dir: str = "", no_knowledge: bool = False,
-                 knowledge_lang: str = "en", max_context_chars: int = 8000,
+                 knowledge_lang: str = "en", max_context_chars: int = 4000,
                  refresh_knowledge: bool = False):
         self.user_id = None
         self.course_id = None
@@ -662,8 +662,8 @@ CONTEXT_SETTINGS = dict(help_option_names=["-h", "--help"], max_content_width=10
 @click.option("--no-knowledge", is_flag=True, help="Disable knowledge base collection.")
 @click.option("--knowledge-lang", default="en", show_default=True,
               help="Subtitle language for lecture transcripts.")
-@click.option("--max-context-chars", default=8000, show_default=True, type=int,
-              help="Max knowledge characters (ringkasan) injected into quiz LLM prompts.")
+@click.option("--max-context-chars", default=4000, show_default=True, type=int,
+              help="Max knowledge characters (ringkasan, relevan per quiz) injected into quiz LLM prompts.")
 @click.option("--refresh-knowledge", is_flag=True,
               help="Re-fetch transcripts/readings even if .md files exist.")
 @click.option("--dump-items", is_flag=True, help="Dump every course item payload (debug).")
