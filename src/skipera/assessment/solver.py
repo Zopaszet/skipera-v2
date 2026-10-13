@@ -69,20 +69,59 @@ _TEXT_FIELDS = (
 )
 
 
+_RICHTEXT_DTD = "assess/1"
+
+
+def _cml_wrap(text):
+    """Escape XML lalu bungkus teks sebagai CML ``<co-content><text>...</text>``."""
+    safe = html.escape(str(text if text is not None else ""), quote=False)
+    return f"<co-content><text>{safe}</text></co-content>"
+
+
+def _cml_unwrap(text):
+    """Ambil teks asli dari CML (strip tag ``<co-content><text>`` + unescape XML)."""
+    if not isinstance(text, str):
+        return ""
+    if "<co-content>" not in text:
+        return text  # teks plain (kandidat 3/4) — jangan diubah
+    match = re.search(r"<co-content>\s*<text>(.*?)</text>\s*</co-content>", text, re.DOTALL)
+    if match:
+        return html.unescape(match.group(1))
+    return html.unescape(re.sub(r"<[^>]+>", "", text))
+
+
+def _richtext_candidates(text):
+    """Kandidat bentuk ``richTextResponse.richText`` (inner), primer (1) -> fallback (4).
+
+    Server menolak ``{"richText": {"value": ...}}`` (value hanya ada di
+    SubmissionHtmlContent, bukan CmlContent), jadi kandidat 1 (cmlValue + dtdId)
+    dipakai sebagai kanonis dan sisanya sebagai fallback berurutan.
+    """
+    plain = str(text if text is not None else "")
+    wrapped = _cml_wrap(plain)
+    return [
+        {"richText": {"cmlValue": wrapped, "dtdId": _RICHTEXT_DTD}},
+        {"richText": {"value": wrapped, "dtdId": _RICHTEXT_DTD}},
+        {"richText": plain},
+        {"richText": {"cmlValue": plain}},
+    ]
+
+
 def _extract_text(value):
     """Pull a plain string out of any text-leaf shape (max one level deep)."""
     if isinstance(value, str):
-        return value
+        return _cml_unwrap(value)
     if isinstance(value, dict):
-        for key in ("plainText", "answer", "text", "value", "richText"):
+        for key in ("plainText", "answer", "text", "cmlValue", "value",
+                    "richText", "htmlWithMetadata"):
             v = value.get(key)
             if isinstance(v, str):
-                return v
+                return _cml_unwrap(v)
             if isinstance(v, dict):
-                for k2 in ("value", "text", "answer", "plainText"):
+                for k2 in ("value", "text", "answer", "plainText", "cmlValue"):
                     v2 = v.get(k2)
                     if isinstance(v2, str):
-                        return v2
+                        return _cml_unwrap(v2)
         return ""
     if isinstance(value, list):
         return " ".join(str(x) for x in value if isinstance(x, str))
@@ -95,7 +134,8 @@ def _sanitize_response(response_field: str, value):
     - checkboxResponse: ``chosen`` -> list ([] bila None/kosong)
     - multipleChoiceResponse: ``chosen`` -> str ("" bila None/list kosong)
     - text leaves (plainText/answer/...): -> "" bila None
-    - richTextResponse: ``{"richText": {"value": "..."}}`` ("" bila None)
+    - richTextResponse: bentuk kanonis ``{"richText": {"cmlValue": CML, "dtdId": "assess/1"}}``
+      (kandidat primer; fallback lewat ``_richtext_candidates`` di save_responses)
     Returns a new dict, never mutates the input.
     """
     if response_field == "checkboxResponse":
@@ -115,9 +155,8 @@ def _sanitize_response(response_field: str, value):
             return {"chosen": chosen[0] if chosen else ""}
         return {"chosen": chosen if isinstance(chosen, str) else ""}
     if response_field == "richTextResponse":
-        inner = value.get("richText") if isinstance(value, dict) else None
-        text = _extract_text(inner if isinstance(inner, dict) else value)
-        return {"richText": {"value": text}}
+        text = _extract_text(value)
+        return _richtext_candidates(text)[0]  # kanonis: cmlValue + dtdId
     # Text leaves: normalize key to the canonical leaf, value to a string.
     leaf = _TEXT_LEAF.get(response_field, "answer")
     return {leaf: _extract_text(value)}
@@ -772,7 +811,8 @@ class GradedSolver(object):
                     value = raw_response[tf]
                     break
             if value is None:
-                for lk in ("plainText", "answer", "text", "value", "richText"):
+                for lk in ("plainText", "answer", "text", "value", "cmlValue",
+                           "richText"):
                     if lk in raw_response:
                         value = raw_response[lk]
                         break
@@ -880,6 +920,15 @@ class GradedSolver(object):
         if "Submission_SaveResponsesSuccess" in res.text:
             return True
 
+        # Fallback: coba kandidat 2..4 bila server tolak bentuk richText kanonis.
+        # Hanya mengganti bagian richTextResponse soal bertipe RICH_TEXT; soal lain tetap.
+        def _richtext_hint(errors):
+            blob = str(errors or "").lower()
+            return ("bad_user_input" in blob
+                    and any(k in blob for k in ("richtext", "/value", "cmlvalue", "cml")))
+
+        richtext_qids = [qid for qid, spec in self.question_specs.items()
+                         if spec.get("response_field") == "richTextResponse"]
         try:
             body = res.json()
             errors = (
@@ -887,11 +936,71 @@ class GradedSolver(object):
                 .get("Submission_SaveResponses", {})
                 .get("errors", [])
             ) or body.get("errors", [])
-            logger.error(f"SaveResponses ditolak server: {str(errors)[:300]}")
-            logger.debug(answer_responses)
-            logger.debug(body)
         except ValueError:
             logger.error(f"SaveResponses gagal (HTTP {res.status_code}): {res.text[:300]}")
+            return False
+
+        if richtext_qids and _richtext_hint(errors):
+            # Ekstrak teks per soal richText dari payload kanonis (untuk rebuild kandidat).
+            texts = {}
+            for r in answer_responses:
+                qr = r.get("questionResponse", {}) or {}
+                if "richTextResponse" in qr:
+                    texts[r["questionId"]] = _extract_text(qr["richTextResponse"])
+            for n in (2, 3, 4):
+                swapped = []
+                for r in answer_responses:
+                    qr = r.get("questionResponse", {}) or {}
+                    if "richTextResponse" in qr:
+                        inner = _richtext_candidates(texts.get(r["questionId"], ""))[n - 1]
+                        r2 = dict(r)
+                        r2["questionResponse"] = {"richTextResponse": inner}
+                        swapped.append(r2)
+                    else:
+                        swapped.append(r)
+                retry = self.session.post(url=GRAPHQL_URL, params={
+                    "opname": "Submission_SaveResponses"
+                }, json={
+                    "operationName": "Submission_SaveResponses",
+                    "variables": {
+                        "input": {
+                            "courseId": self.course_id,
+                            "itemId": self.item_id,
+                            "attemptId": self.draft_id,
+                            "questionResponses": swapped
+                        }
+                    },
+                    "query": SAVE_RESPONSES_QUERY
+                })
+                if "Submission_SaveResponsesSuccess" in retry.text:
+                    logger.success(f"server menerima bentuk richText kandidat-{n}")
+                    # last_submitted = bentuk yang diterima server
+                    self.last_submitted = [
+                        {"question_id": r["questionId"], "question_response": r["questionResponse"]}
+                        for r in swapped
+                    ]
+                    return True
+                # total percobaan save <= 4 (1 kanonis + 3 fallback); lanjut ke kandidat berikutnya
+            try:
+                retry_body = retry.json()
+                retry_errors = (
+                    retry_body.get("data", {})
+                    .get("Submission_SaveResponses", {})
+                    .get("errors", [])
+                ) or retry_body.get("errors", [])
+            except ValueError:
+                retry_errors = []
+            all_errors = list(errors or []) + list(retry_errors or [])
+            logger.error(
+                f"SaveResponses ditolak server (semua kandidat richText gagal): "
+                f"{str(all_errors)[:2000]}")
+            logger.debug(answer_responses)
+            logger.debug(body)
+            return False
+
+        logger.error(f"SaveResponses ditolak server: {str(errors)[:2000]}")
+        logger.debug(answer_responses)
+        logger.debug(body)
         return False
 
     def submit_draft(self) -> bool:
