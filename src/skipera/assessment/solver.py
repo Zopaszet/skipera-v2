@@ -1,4 +1,6 @@
 import html
+import json
+import os
 import re
 import time
 
@@ -10,6 +12,11 @@ from .queries import (GET_STATE_QUERY, SAVE_RESPONSES_QUERY, SUBMIT_DRAFT_QUERY,
                       INITIATE_ATTEMPT_QUERY)
 from loguru import logger
 from skipera.llm.connector import build_connector
+
+
+INPUT_CHARS_PER_TOKEN = 4
+OVERHEAD_CHARS = 1500      # system prompt + instruksi + wrapper
+MIN_KNOWLEDGE_CHARS = 1500
 
 
 # Short type codes for LLM payload (hemat token)
@@ -165,7 +172,8 @@ def _sanitize_response(response_field: str, value):
 class GradedSolver(object):
     def __init__(self, session: requests.Session, course_id: str, item_id: str,
                  llm_settings: dict = None, knowledge_context: str = "",
-                 knowledge_dir=None, course_slug: str = "", max_chars: int = 4000):
+                 knowledge_dir=None, course_slug: str = "", max_chars: int = 4000,
+                 input_token_budget: int = 5000):
         self.session: requests.Session = session
         self.course_id: str = course_id
         self.item_id: str = item_id
@@ -174,6 +182,7 @@ class GradedSolver(object):
         self.knowledge_dir = knowledge_dir
         self.course_slug = course_slug
         self.max_chars = max_chars
+        self.input_token_budget = input_token_budget
         self.attempt_id = None
         self.draft_id = None
         self.discarded_questions = []
@@ -404,7 +413,7 @@ class GradedSolver(object):
                     lines.append(f"  dulu: {short_chosen}")
         else:
             lines.append("Tidak ada rincian soal yang salah; jawab ulang semuanya dengan teliti.")
-        return "\n".join(lines)
+        return "\n".join(lines) + "\n\nIMPORTANT: Do NOT repeat the same wrong answer. Think differently and verify against course material."
 
     def _build_sibling_appendix(self, subset_shorts: set) -> str:
         """Context appendix: soal benar yang TIDAK dikirim ke LLM + jawabannya.
@@ -489,7 +498,7 @@ class GradedSolver(object):
             if prev_full:
                 short_chosen = [opt_reverse.get(c, c) for c in prev_full]
                 lines.append(f"  dulu: {short_chosen}")
-        return "\n".join(lines)
+        return "\n".join(lines) + "\n\nIMPORTANT: Do NOT repeat the same wrong answer. Think differently and verify against course material."
 
     def _solve_current_attempt(self, retry_note: str = "", only_qids=None) -> str:
         try:
@@ -558,8 +567,16 @@ class GradedSolver(object):
         if self.knowledge_dir and self.course_slug:
             try:
                 from skipera.knowledge import load_knowledge_context
+                q_chars = len(json.dumps(questions, ensure_ascii=False))
+                budget_chars = self.input_token_budget * INPUT_CHARS_PER_TOKEN
+                remaining = budget_chars - q_chars - OVERHEAD_CHARS
+                kb = max(MIN_KNOWLEDGE_CHARS, min(self.max_chars, remaining))
+                logger.debug(
+                    f"Budget konteks: total={self.input_token_budget} tok, soal={q_chars} char, "
+                    f"konteks={kb} char"
+                )
                 relevant = load_knowledge_context(
-                    self.knowledge_dir, self.course_slug, self.max_chars, query=questions)
+                    self.knowledge_dir, self.course_slug, kb, query=questions)
                 if relevant:
                     context = relevant
             except Exception as exc:
@@ -572,7 +589,8 @@ class GradedSolver(object):
             if appendix:
                 context = (context + "\n\n" if context else "") + appendix
         try:
-            answers = connector.get_response(questions, context=context)
+            retry_temp = 0.35 if retry_note else 0.0
+            answers = connector.get_response(questions, context=context, temperature=retry_temp)
         except Exception as exc:
             self.last_error = str(exc)
             logger.error(f"Could not get answers from LLM: {exc}")
@@ -719,13 +737,17 @@ class GradedSolver(object):
         return questions_formatted
 
     def _format_question_for_llm(self, question: dict, short_qid: str) -> dict:
+        # Token-tight mode: cap prompt/option length when SKIPERA_SHORT_PROMPT=1.
+        short = os.getenv("SKIPERA_SHORT_PROMPT") == "1"
+        prompt_cap = 400 if short else 800
+        opt_cap = 100 if short else 200
         typename = question["__typename"]
         schema = question.get("questionSchema", {})
         raw_prompt = schema.get("prompt", {}).get("cmlValue") or schema.get("prompt", {}).get("value") or ""
         payload = {
             "question_id": short_qid,
             "type": _SHORT_TYPE_MAP.get(typename, "TXT"),
-            "prompt": _clean_text(raw_prompt, 2000),
+            "prompt": _clean_text(raw_prompt, prompt_cap),
         }
 
         if "options" in schema:
@@ -740,7 +762,7 @@ class GradedSolver(object):
                 raw_value = option.get("display", {}).get("cmlValue") or option.get("display", {}).get("value") or ""
                 options_list.append({
                     "id": short_opt,
-                    "v": _clean_text(raw_value, 500),
+                    "v": _clean_text(raw_value, opt_cap),
                 })
             self.opt_map[short_qid] = opt_map
             payload["options"] = options_list

@@ -1,4 +1,5 @@
 import json
+import time
 
 import requests
 from loguru import logger
@@ -8,23 +9,23 @@ from skipera.config import SYSTEM_PROMPT
 
 ANSWER_INSTRUCTIONS = (
     "Return JSON only with shape {\"responses\":[...]}. "
-    "Each item must include question_id and question_response. "
-    "For question_response, use the short type code mapping: "
+    "Each item must include \"question_id\" matching the original question id exactly and "
+    "\"question_response\" using the short type code mapping: "
     "MC->{\"multipleChoiceResponse\":{\"chosen\":\"O1\"}}; "
     "MS->{\"checkboxResponse\":{\"chosen\":[\"O1\",\"O2\"]}}; "
-    "TXT->{\"plainTextResponse\":{\"plainText\":\"...\"}} (for "
-    "Numeric/Math/Regex/TextExactMatch/TextReflect use "
-    "{\"plainTextResponse\":{\"plainText\":\"...\"}} or "
-    "{\"textReflectResponse\":{\"answer\":\"...\"}}; "
-    "for RichText use {\"richTextResponse\":{\"richText\":{\"value\":\"...\"}}}). "
-    "Do NOT include answer_format per question."
+    "TXT->{\"plainTextResponse\":{\"plainText\":\"...\"}} for all plain text variants "
+    "(Numeric/Math/Regex/TextExactMatch/TextReflect); "
+    "RichText->{\"richTextResponse\":{\"richText\":{\"value\":\"...\"}}}. "
+    "Do NOT include any answer_format field or additional keys."
 )
 
 CONTEXT_INSTRUCTIONS = (
-    "You are given summarized course material (condensed video transcripts + "
-    "readings) as the knowledge base. Prioritize the summary when answering: "
-    "if it covers the question, base your answer on it. Otherwise fall back "
-    "to general knowledge."
+    "You are given a summarized knowledge base of relevant video transcript "
+    "excerpts and reading excerpts. Treat it as the COURSE MATERIAL and your "
+    "primary source: if it contains information that answers the question, "
+    "base your answer on it (paraphrase implicitly, do not invent citations). "
+    "Never fabricate; if the material does not cover the answer, fall back to "
+    "general knowledge only as a last resort."
 )
 
 
@@ -33,6 +34,7 @@ def _build_user_content(questions: dict, context: str = "") -> str:
         return (
             f"{CONTEXT_INSTRUCTIONS}\n\n"
             f"--- COURSE MATERIAL START ---\n{context.strip()}\n--- COURSE MATERIAL END ---\n\n"
+            "If COURSE MATERIAL covers the answer, you MUST base your answer on it.\n\n"
             f"{ANSWER_INSTRUCTIONS}\n\n{json.dumps(questions)}"
         )
     return f"{ANSWER_INSTRUCTIONS}\n\n{json.dumps(questions)}"
@@ -129,7 +131,7 @@ class GeminiConnector(object):
         self.system_prompt = system_prompt
         self.client = genai.Client(api_key=self.api_key)
 
-    def get_response(self, questions: dict, context: str = "") -> dict:
+    def get_response(self, questions: dict, context: str = "", temperature: float = None) -> dict:
         logger.debug(f"Making an API request to Gemini ({self.model})...")
         response = self.client.models.generate_content(
             model=self.model,
@@ -137,6 +139,7 @@ class GeminiConnector(object):
             config=self._types.GenerateContentConfig(
                 system_instruction=self.system_prompt,
                 response_mime_type="application/json",
+                temperature=0.0 if temperature is None else temperature,
             ),
         )
         raw_text = response.candidates[0].content.parts[0].text
@@ -159,6 +162,7 @@ class OpenAICompatibleConnector(object):
         self.model = model
         self.system_prompt = system_prompt
         self.timeout = timeout
+        self.temperature = 0.0
 
     def _chat_completions_url(self) -> str:
         # Allow either ".../v1" or a full ".../v1/chat/completions" base URL.
@@ -193,7 +197,8 @@ class OpenAICompatibleConnector(object):
             )
             return requests.post(alt, json=payload, headers=headers, timeout=self.timeout)
 
-    def _request(self, questions: dict, use_json_mode: bool, context: str = "") -> requests.Response:
+    def _request(self, questions: dict, use_json_mode: bool, context: str = "",
+                 temperature: float = None) -> requests.Response:
         payload = {
             "model": self.model,
             "messages": [
@@ -201,7 +206,8 @@ class OpenAICompatibleConnector(object):
                 {"role": "user",
                  "content": _build_user_content(questions, context)},
             ],
-            "temperature": 0.2,
+            "temperature": self.temperature if temperature is None else temperature,
+            "top_p": 0.95,
             "stream": False,
         }
         if use_json_mode:
@@ -213,20 +219,42 @@ class OpenAICompatibleConnector(object):
 
         return self._post(payload, headers)
 
-    def get_response(self, questions: dict, context: str = "") -> dict:
+    @staticmethod
+    def _is_transient(response: requests.Response) -> bool:
+        """True for retryable failures: 429, 5xx, or an 'unavailable'/overloaded body."""
+        if response.status_code == 429 or response.status_code >= 500:
+            return True
+        if response.status_code == 400:
+            body = (response.text or "").lower()
+            return any(k in body for k in
+                       ("unavailable", "server_error", "overloaded"))
+        return False
+
+    def get_response(self, questions: dict, context: str = "", temperature: float = None) -> dict:
         logger.debug(
             f"Making an API request to {self.base_url} "
             f"(model={self.model or 'default'})..."
         )
 
-        response = self._request(questions, use_json_mode=True, context=context)
-        # Many local routers reject response_format; retry once without it.
-        if response.status_code in (400, 404, 415, 422):
-            logger.debug(
-                f"Endpoint rejected JSON mode ({response.status_code}); "
-                "retrying without response_format..."
-            )
-            response = self._request(questions, use_json_mode=False, context=context)
+        response = None
+        for attempt in range(1, 4):
+            response = self._request(questions, use_json_mode=True, context=context, temperature=temperature)
+            # Many local routers reject response_format; retry once without it.
+            if response.status_code in (400, 404, 415, 422):
+                logger.debug(
+                    f"Endpoint rejected JSON mode ({response.status_code}); "
+                    "retrying without response_format..."
+                )
+                response = self._request(questions, use_json_mode=False, context=context, temperature=temperature)
+            # Retry transient router failures (429 / 5xx / "unavailable"/overloaded);
+            # non-transient errors fall through to the raise below unchanged.
+            if self._is_transient(response) and attempt < 3:
+                logger.warning(
+                    f"LLM transient error ({response.status_code}); retry {attempt}/3..."
+                )
+                time.sleep(1.5 * attempt)
+                continue
+            break
 
         if response.status_code >= 400:
             raise RuntimeError(

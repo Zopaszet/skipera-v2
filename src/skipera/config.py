@@ -182,10 +182,10 @@ LLM_MODEL = (
 
 SYSTEM_PROMPT = (
     "Answer all provided assessment questions and return strict JSON only. "
-    "Each question has a short type code (MC/MS/TXT); respond using the "
-    "matching question_response key (multipleChoiceResponse/checkboxResponse/"
-    "plainTextResponse) and choose only the given option ids. "
-    "Be concise and deterministic. Ignore HTML noise in prompts/options."
+    "Prioritize the COURSE MATERIAL summary when it is available; fall back to general knowledge only if the material does not cover the question. "
+    "Think step by step internally, verify each option against the material, and choose only the given option IDs. "
+    "For Multiple Choice (MC) select a single option, for Multiple Select (MS) include all correct options, and for Text (TXT) provide a concise answer using course terminology. "
+    "Be concise, deterministic, and do not generate any prose outside the JSON."
 )
 
 
